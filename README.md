@@ -36,13 +36,29 @@ make sync          # uv sync --all-groups
 
 ### 3. Build the dataset
 
-Downloads the SMS Spam Collection and the Davidson Hate-Speech &
-Offensive-Language datasets, normalises and balances them into
-`data/processed/messages.csv` (target ~3000 rows per class):
+Downloads five public datasets, normalises and balances them into
+`data/processed/messages.csv` (12,000 rows, 3,000 per class):
+
+| Source | Rows | Used for |
+| ------ | ---: | -------- |
+| **SMS Spam Collection** (UCI) | ~5,500 | `spam` (ham + spam) |
+| **Davidson Hate-Speech & Offensive Language** | ~25,000 | `hateful` / `abusive` / `normal` |
+| **HateXplain** (Mathew et al.) | ~20,000 | `hateful` / `abusive` / `normal` (majority vote of 3 annotators) |
+| **DailyDialog** (Li et al., 2017 -- `pixelsandpointers/better_daily_dialog` mirror) | ~87,000 utterances | `normal` |
+| **Enron-Spam** (Metsis et al. -- `SetFit/enron_spam` mirror) | ~33,000 emails | `spam` + `normal` (Subject + Message concatenated; rows outside 10-800 chars dropped to stay close to chat-messaging length) |
 
 ```bash
-make data
+make data           # downloads + builds messages.csv
+make data EXTRA="--exclude hatexplain dailydialog enron"   # ablation against the original 2-source baseline
 ```
+
+Reading DailyDialog requires `pyarrow`, declared in the build-time
+`data` dependency group of [pyproject.toml](pyproject.toml). It is *not*
+installed in the runtime Docker image.
+
+Per-class raw pools after all sources (before balancing): normal ~97k,
+abusive ~25k, spam ~9k, hateful ~7.6k. The balance step samples 3,000
+rows per class with `random_state=42`.
 
 ### 4. Train the classifier
 
@@ -263,7 +279,7 @@ message-classifier/
     schemas.py             # Pydantic request / response models
     main.py                # FastAPI app factory + lifespan
   scripts/
-    download_data.py       # fetch SMS Spam + Davidson datasets
+    download_data.py       # fetch SMS Spam + Davidson + HateXplain + DailyDialog + Enron-Spam
     build_dataset.py       # combine + balance -> data/processed/messages.csv
     train.py               # train and persist models/classifier.joblib
     evaluate.py            # re-evaluate + confusion matrix PNG

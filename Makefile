@@ -24,6 +24,7 @@ sync:
 	$(UV) sync --all-groups
 
 data:
+	$(UV) sync --group data
 	$(UV) run python -m scripts.download_data
 	$(UV) run python -m scripts.build_dataset
 

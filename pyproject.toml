@@ -34,6 +34,11 @@ dev = [
     "ruff>=0.5,<1.0",
     "matplotlib>=3.8,<4.0",
 ]
+# Build-time only: required by `make data` (parquet reading for DailyDialog).
+# Intentionally NOT installed in the runtime Docker image.
+data = [
+    "pyarrow>=15,<22",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
