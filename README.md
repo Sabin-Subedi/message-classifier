@@ -1,0 +1,316 @@
+# Message Classifier
+
+Intelligent Messaging Safety & Priority Classifier — a Python micro‑service
+that categorises text messages into one of four classes:
+
+| Label      | Meaning                                                              |
+| ---------- | -------------------------------------------------------------------- |
+| `normal`   | Regular conversational message — safe to display in the main chat.   |
+| `spam`     | Promotional, fraudulent, or otherwise unwanted message.              |
+| `abusive`  | Aggressive, insulting, or harassing language directed at others.     |
+| `hateful`  | Hateful or discriminatory language targeting a person or group.      |
+
+The service is designed to be called by a MERN backend (Node.js + Express)
+over HTTP. The MERN side stores messages in MongoDB and uses the returned
+label to decide whether a message goes straight into the chat or is hidden
+behind a "view this flagged message?" warning, as described in the project
+report (Chapters 1–3).
+
+Stack: **FastAPI**, **scikit-learn** (TF‑IDF + Multinomial Naive Bayes),
+**NLTK** (preprocessing), **uv** (package management), **Docker**.
+
+## Quickstart
+
+### 1. Prerequisites
+
+- [`uv`](https://docs.astral.sh/uv/) (`brew install uv`)
+- Python 3.10–3.12 (uv will auto-provision the version pinned in
+  [`.python-version`](.python-version) if needed)
+- Docker (Docker Desktop / OrbStack / colima) for the container workflow
+
+### 2. Install dependencies
+
+```bash
+make sync          # uv sync --all-groups
+```
+
+### 3. Build the dataset
+
+Downloads the SMS Spam Collection and the Davidson Hate-Speech &
+Offensive-Language datasets, normalises and balances them into
+`data/processed/messages.csv` (target ~3000 rows per class):
+
+```bash
+make data
+```
+
+### 4. Train the classifier
+
+```bash
+make train
+```
+
+Outputs:
+
+- `models/classifier.joblib` — the fitted sklearn `Pipeline`
+  (preprocessing + TF-IDF + MultinomialNB)
+- `models/metrics.json` — accuracy, per-class precision/recall/F1,
+  confusion matrix, train/val/test split sizes, and timestamp
+
+Optional: `make evaluate` re-runs the test split and saves
+`models/confusion_matrix.png`.
+
+### 5. Run the service
+
+```bash
+make run                       # uvicorn on http://127.0.0.1:8000
+# or
+make docker-up                 # docker compose up -d
+make docker-logs               # tail container logs
+make docker-down
+```
+
+OpenAPI docs: <http://localhost:8000/docs>
+
+## Make targets
+
+| Target          | Description                                       |
+| --------------- | ------------------------------------------------- |
+| `sync`          | Create venv and install runtime + dev deps (uv)   |
+| `data`          | Download raw datasets and build `messages.csv`    |
+| `train`         | Train the classifier and save artifacts           |
+| `evaluate`      | Re-evaluate the trained model on the test split   |
+| `run`           | Run FastAPI locally with `--reload`               |
+| `test`          | Run pytest                                        |
+| `lint`          | Run ruff lint                                     |
+| `format`        | Run ruff format                                   |
+| `docker-build`  | Build the Docker image                            |
+| `docker-up`     | Start the classifier via `docker compose`         |
+| `docker-down`   | Stop the docker-compose stack                     |
+| `docker-logs`   | Tail container logs                               |
+| `clean`         | Remove caches and build artifacts                 |
+
+## Configuration
+
+Settings are loaded from environment variables (or a local `.env` —
+see [`.env.example`](.env.example)).
+
+| Variable          | Default                       | Notes                                                    |
+| ----------------- | ----------------------------- | -------------------------------------------------------- |
+| `MODEL_PATH`      | `models/classifier.joblib`    | Path to the trained pipeline.                            |
+| `METRICS_PATH`    | `models/metrics.json`         | Optional metrics file surfaced by `/api/v1/info`.        |
+| `API_KEY`         | *(empty)*                     | When set, all `/predict*` and `/info` calls require `X-API-Key`. |
+| `LOG_LEVEL`       | `INFO`                        | Standard Python logging level.                           |
+| `MAX_BATCH_SIZE`  | `100`                         | Maximum number of texts in `/predict/batch`.             |
+| `MAX_TEXT_LENGTH` | `4000`                        | Hard cap on individual text length (chars).              |
+| `NLTK_DATA`       | `<repo>/.nltk_data`           | Where NLTK corpora live.                                 |
+| `CLASSIFIER_PORT` | `8000`                        | Host port mapping in `docker-compose.yml`.               |
+| `CLASSIFIER_API_KEY` | *(empty)*                  | Forwarded as `API_KEY` to the container.                 |
+
+## API contract
+
+All endpoints live under `/api/v1`. Endpoints marked **(auth)** require
+the `X-API-Key` header when `API_KEY` is configured.
+
+### `GET /api/v1/health`
+
+Liveness probe. Always returns 200 if the process is running.
+
+```json
+{ "status": "ok", "app": "message-classifier", "version": "0.1.0" }
+```
+
+### `GET /api/v1/ready`
+
+Readiness probe. Returns 200 once the model is loaded; 503 otherwise
+(e.g. before training or if the artifact is missing).
+
+### `GET /api/v1/info` *(auth)*
+
+Returns model metadata and metrics:
+
+```json
+{
+  "app_version": "0.1.0",
+  "model_path": "/app/models/classifier.joblib",
+  "model_version": "0.1.0",
+  "trained_at": "2026-06-16T10:00:00+00:00",
+  "classes": ["abusive", "hateful", "normal", "spam"],
+  "metrics": { "test": { "accuracy": 0.93, "f1_macro": 0.92, "...": "..." } }
+}
+```
+
+### `POST /api/v1/predict` *(auth)*
+
+Request:
+
+```json
+{ "text": "congrats you won a free prize click here now" }
+```
+
+Response (200):
+
+```json
+{
+  "label": "spam",
+  "confidence": 0.93,
+  "probabilities": {
+    "normal":  0.02,
+    "spam":    0.93,
+    "abusive": 0.03,
+    "hateful": 0.02
+  }
+}
+```
+
+Validation errors return 422; oversized text returns 413.
+
+### `POST /api/v1/predict/batch` *(auth)*
+
+Request:
+
+```json
+{ "texts": ["see you tomorrow", "you idiot shut up"] }
+```
+
+Response (200):
+
+```json
+{
+  "results": [
+    { "label": "normal", "confidence": 0.81, "probabilities": { "..." : 0.0 } },
+    { "label": "abusive", "confidence": 0.74, "probabilities": { "...": 0.0 } }
+  ]
+}
+```
+
+Batches larger than `MAX_BATCH_SIZE` (default 100) return 400.
+
+## Calling from the MERN backend
+
+```env
+# backend/.env
+CLASSIFIER_URL=http://localhost:8000
+CLASSIFIER_API_KEY=change-me
+```
+
+```js
+// backend/src/services/classifier.js
+const CLASSIFIER_URL = process.env.CLASSIFIER_URL;
+const CLASSIFIER_API_KEY = process.env.CLASSIFIER_API_KEY;
+
+export async function classifyMessage(text) {
+  const res = await fetch(`${CLASSIFIER_URL}/api/v1/predict`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(CLASSIFIER_API_KEY ? { "X-API-Key": CLASSIFIER_API_KEY } : {}),
+    },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`classifier error: ${res.status} ${await res.text()}`);
+  }
+  return res.json(); // { label, confidence, probabilities }
+}
+```
+
+```js
+// backend/src/routes/messages.js
+router.post("/messages", auth, async (req, res, next) => {
+  try {
+    const { text, recipientId } = req.body;
+    const { label, confidence } = await classifyMessage(text);
+
+    const message = await Message.create({
+      sender: req.user.id,
+      recipient: recipientId,
+      text,
+      label,
+      confidence,
+    });
+
+    res.status(201).json(message);
+  } catch (err) {
+    next(err);
+  }
+});
+```
+
+Equivalent curl:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/predict \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: change-me" \
+  -d '{"text":"congrats you won a free prize click here now"}'
+```
+
+## Project layout
+
+```
+message-classifier/
+  app/
+    api/routes.py          # /health, /ready, /info, /predict, /predict/batch
+    core/config.py         # pydantic-settings: MODEL_PATH, API_KEY, ...
+    core/security.py       # X-API-Key header dependency
+    core/logging.py        # central logging config
+    ml/labels.py           # canonical 4-class label set
+    ml/preprocessing.py    # lowercase + tokenise + stopwords + lemmatise
+    ml/pipeline.py         # build_pipeline() -> sklearn Pipeline
+    ml/predictor.py        # Predictor.load(...).predict(...)
+    schemas.py             # Pydantic request / response models
+    main.py                # FastAPI app factory + lifespan
+  scripts/
+    download_data.py       # fetch SMS Spam + Davidson datasets
+    build_dataset.py       # combine + balance -> data/processed/messages.csv
+    train.py               # train and persist models/classifier.joblib
+    evaluate.py            # re-evaluate + confusion matrix PNG
+  tests/                   # pytest suite (preprocessing, predictor, api)
+  data/                    # raw/, processed/  (gitignored)
+  models/                  # artifacts            (gitignored)
+  Dockerfile               # multi-stage (uv builder -> python:3.12-slim runtime)
+  docker-compose.yml       # single classifier service
+  pyproject.toml           # project deps + dev group + ruff/pytest config
+  uv.lock                  # uv lockfile (committed)
+  Makefile                 # convenience targets
+```
+
+## ML pipeline
+
+A single sklearn `Pipeline` so preprocessing is bundled with the model and
+identical at train time and serve time:
+
+```
+TextCleaner          # lowercase, strip URLs/emails, tokenise, stopwords, lemmatise (NLTK)
+   |
+TfidfVectorizer      # ngram_range=(1,2), min_df=2, max_df=0.95, sublinear_tf=True
+   |
+MultinomialNB        # alpha=0.3
+```
+
+- Train/val/test split: 70/20/10 stratified, `random_state=42`
+  (matches report §3.9).
+- Persisted with `joblib.dump` → a single `models/classifier.joblib` file.
+- `models/metrics.json` records accuracy, macro / weighted F1, per-class
+  precision / recall / F1, and the test-split confusion matrix.
+
+## Tests
+
+```bash
+make test
+```
+
+Covers:
+
+- Preprocessing (lower-casing, URL/email stripping, stopwords,
+  lemmatisation, edge cases).
+- `Predictor` roundtrip (train → save → load → predict).
+- FastAPI surface: `/health`, `/ready` (with and without a model),
+  `/info`, `/predict`, `/predict/batch`, validation failures, batch
+  limit, and `X-API-Key` enforcement.
+
+## License
+
+MIT. See [LICENSE](LICENSE) (add your own if redistributing).

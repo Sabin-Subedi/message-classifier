@@ -1,0 +1,26 @@
+services:
+  classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: message-classifier:latest
+    container_name: message-classifier
+    restart: unless-stopped
+    ports:
+      - "${CLASSIFIER_PORT:-8000}:8000"
+    environment:
+      MODEL_PATH: /app/models/classifier.joblib
+      METRICS_PATH: /app/models/metrics.json
+      API_KEY: ${CLASSIFIER_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_BATCH_SIZE: ${MAX_BATCH_SIZE:-100}
+      MAX_TEXT_LENGTH: ${MAX_TEXT_LENGTH:-4000}
+    volumes:
+      # Trained model is produced on the host with `make train` and mounted in.
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/api/v1/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
