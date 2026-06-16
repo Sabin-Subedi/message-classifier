@@ -63,18 +63,33 @@ rows per class with `random_state=42`.
 ### 4. Train the classifier
 
 ```bash
-make train
+make train          # baseline (~3 s on the full 12k dataset)
+make train-tuned    # GridSearchCV over alpha + word/char ngram ranges (~20 s)
 ```
 
 Outputs:
 
 - `models/classifier.joblib` — the fitted sklearn `Pipeline`
-  (preprocessing + TF-IDF + MultinomialNB)
+  (preprocessing + word/char TF-IDF FeatureUnion + MultinomialNB)
 - `models/metrics.json` — accuracy, per-class precision/recall/F1,
-  confusion matrix, train/val/test split sizes, and timestamp
+  confusion matrix, train/val/test split sizes, timestamp, and (when
+  `--grid-search` is used) the tuned hyperparameters under a
+  `grid_search` key.
 
 Optional: `make evaluate` re-runs the test split and saves
 `models/confusion_matrix.png`.
+
+Latest test-split metrics on the 12,000-row dataset (`random_state=42`,
+n_test=1,200):
+
+| Variant                                   | macro-F1 | normal F1 | spam F1 | abusive F1 | hateful F1 |
+| ----------------------------------------- | -------: | --------: | ------: | ---------: | ---------: |
+| Round 3 (word TF-IDF only)                |    0.782 |     0.743 |   0.921 |      0.733 |      0.731 |
+| Round 4 baseline (preproc + char n-grams) |    0.807 |     0.772 |   0.935 |      0.755 |      0.766 |
+| Round 4 tuned (`make train-tuned`)        |    0.814 |     0.799 |   0.940 |      0.763 |      0.755 |
+
+Best params chosen by 5-fold CV (`f1_macro`):
+`clf__alpha=0.1`, `word__ngram_range=(1,3)`, `char__ngram_range=(3,4)`.
 
 ### 5. Run the service
 
@@ -95,6 +110,7 @@ OpenAPI docs: <http://localhost:8000/docs>
 | `sync`          | Create venv and install runtime + dev deps (uv)   |
 | `data`          | Download raw datasets and build `messages.csv`    |
 | `train`         | Train the classifier and save artifacts           |
+| `train-tuned`   | Train via GridSearchCV over alpha + ngram ranges  |
 | `evaluate`      | Re-evaluate the trained model on the test split   |
 | `run`           | Run FastAPI locally with `--reload`               |
 | `test`          | Run pytest                                        |
@@ -273,8 +289,8 @@ message-classifier/
     core/security.py       # X-API-Key header dependency
     core/logging.py        # central logging config
     ml/labels.py           # canonical 4-class label set
-    ml/preprocessing.py    # lowercase + tokenise + stopwords + lemmatise
-    ml/pipeline.py         # build_pipeline() -> sklearn Pipeline
+    ml/preprocessing.py    # lowercase + neg-aware tokenise + punctuation sentinels + lemmatise
+    ml/pipeline.py         # build_pipeline() -> Pipeline w/ word + char_wb FeatureUnion
     ml/predictor.py        # Predictor.load(...).predict(...)
     schemas.py             # Pydantic request / response models
     main.py                # FastAPI app factory + lifespan
@@ -299,15 +315,33 @@ A single sklearn `Pipeline` so preprocessing is bundled with the model and
 identical at train time and serve time:
 
 ```
-TextCleaner          # lowercase, strip URLs/emails, tokenise, stopwords, lemmatise (NLTK)
+TextCleaner                                # lowercase, strip URLs/emails,
+   |                                       # keep negations (`not`, `n't`, ...),
+   |                                       # emit _excl_ / _qst_ punctuation
+   |                                       # sentinels, tokenise via NLTK,
+   |                                       # drop other stopwords, lemmatise
    |
-TfidfVectorizer      # ngram_range=(1,2), min_df=2, max_df=0.95, sublinear_tf=True
+FeatureUnion
+   ├── TfidfVectorizer (analyzer="word",    ngram_range=(1,2|3))
+   └── TfidfVectorizer (analyzer="char_wb", ngram_range=(3,4|5))
    |
-MultinomialNB        # alpha=0.3
+MultinomialNB                              # alpha=0.3 (or tuned by GridSearchCV)
 ```
+
+The `char_wb` branch lets the classifier generalise across simple
+obfuscations (`idi0t`, `st*pid`) that pure word n-grams miss; the
+preserved negation tokens prevent `"i do not hate you"` and
+`"i hate you"` from collapsing into the same bag-of-words; and the
+`_excl_` / `_qst_` sentinels surface punctuation as a feature without
+touching the vectorizer config.
 
 - Train/val/test split: 70/20/10 stratified, `random_state=42`
   (matches report §3.9).
+- `make train` fits with the default hyperparameters above.
+- `make train-tuned` runs `GridSearchCV` (5-fold, scoring `f1_macro`)
+  over `alpha`, `word_ngram_range`, and `char_ngram_range`
+  (3 × 3 × 2 = 18 combos), and saves `grid_search.best_params` into
+  `metrics.json`.
 - Persisted with `joblib.dump` → a single `models/classifier.joblib` file.
 - `models/metrics.json` records accuracy, macro / weighted F1, per-class
   precision / recall / F1, and the test-split confusion matrix.
@@ -321,8 +355,13 @@ make test
 Covers:
 
 - Preprocessing (lower-casing, URL/email stripping, stopwords,
-  lemmatisation, edge cases).
+  lemmatisation, edge cases, **negation retention**, and
+  **`_excl_` / `_qst_` punctuation sentinels**).
+- Pipeline structure (word + `char_wb` `FeatureUnion`) and a smoke
+  test asserting that char n-grams generalise from `idiot` to `id1ot`.
 - `Predictor` roundtrip (train → save → load → predict).
+- `--grid-search` smoke test (1-combo grid on a 200-row fixture)
+  validating that `metrics.json` gets a `grid_search.best_params` block.
 - FastAPI surface: `/health`, `/ready` (with and without a model),
   `/info`, `/predict`, `/predict/batch`, validation failures, batch
   limit, and `X-API-Key` enforcement.

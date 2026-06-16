@@ -24,7 +24,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, train_test_split
 
 from app import __version__ as APP_VERSION
 from app.ml.labels import LABELS
@@ -40,6 +40,18 @@ DEFAULT_RANDOM_STATE = 42
 # 70/20/10 train/val/test split per report Â§3.9.
 VAL_FRACTION = 0.20
 TEST_FRACTION = 0.10
+
+# Grid for `--grid-search`. 3 word ranges x 2 char ranges x 3 alphas = 18 combos.
+# At 5-fold CV that's 90 fits; ~3-6 min on the full 12k dataset.
+PARAM_GRID: dict = {
+    "features__word__ngram_range": [(1, 1), (1, 2), (1, 3)],
+    "features__char__ngram_range": [(3, 4), (3, 5)],
+    "clf__alpha": [0.1, 0.3, 1.0],
+}
+GRID_SEARCH_CV_FOLDS = 5
+# `-1` -> all cores. Tests override this to 1 to keep grid-search smoke
+# tests friendly to sandboxes that disallow multiprocessing semaphores.
+GRID_SEARCH_N_JOBS = -1
 
 
 def _split(
@@ -125,14 +137,36 @@ def _evaluate(
     }
 
 
+def _serialize_param_value(value):
+    """Render a single grid-search param value into JSON-friendly form."""
+
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _serialize_params(params: dict) -> dict:
+    """Best-effort JSON serialisation for a grid-search params dict."""
+
+    return {k: _serialize_param_value(v) for k, v in params.items()}
+
+
 def train(
     *,
     dataset_path: Path = DEFAULT_DATASET,
     model_path: Path = DEFAULT_MODEL_PATH,
     metrics_path: Path = DEFAULT_METRICS_PATH,
     random_state: int = DEFAULT_RANDOM_STATE,
+    grid_search: bool = False,
 ) -> dict:
-    """Train the pipeline end-to-end and persist artifacts."""
+    """Train the pipeline end-to-end and persist artifacts.
+
+    When ``grid_search=True``, runs :class:`GridSearchCV` over
+    :data:`PARAM_GRID` on the training split, optimising macro-F1, and uses
+    the resulting ``best_estimator_`` as the final pipeline. The chosen
+    hyperparameters are recorded under the ``grid_search`` key of
+    ``metrics.json``.
+    """
 
     if not dataset_path.exists():
         raise FileNotFoundError(
@@ -156,8 +190,44 @@ def train(
     )
 
     pipeline = build_pipeline()
-    logger.info("Fitting pipeline on training split...")
-    pipeline.fit(list(train_df["text"]), list(train_df["label"]))
+    grid_results: dict | None = None
+
+    if grid_search:
+        n_combos = 1
+        for v in PARAM_GRID.values():
+            n_combos *= len(v)
+        logger.info(
+            "Running GridSearchCV: %d combos x %d folds = %d fits (this can take several minutes)",
+            n_combos,
+            GRID_SEARCH_CV_FOLDS,
+            n_combos * GRID_SEARCH_CV_FOLDS,
+        )
+        cv = GridSearchCV(
+            pipeline,
+            PARAM_GRID,
+            scoring="f1_macro",
+            cv=GRID_SEARCH_CV_FOLDS,
+            n_jobs=GRID_SEARCH_N_JOBS,
+            verbose=1,
+            refit=True,
+        )
+        cv.fit(list(train_df["text"]), list(train_df["label"]))
+        pipeline = cv.best_estimator_
+        grid_results = {
+            "best_params": _serialize_params(cv.best_params_),
+            "best_cv_score": float(cv.best_score_),
+            "n_combinations": int(len(cv.cv_results_["params"])),
+            "scoring": "f1_macro",
+            "cv_folds": GRID_SEARCH_CV_FOLDS,
+        }
+        logger.info(
+            "GridSearchCV finished. best_cv_f1_macro=%.4f best_params=%s",
+            grid_results["best_cv_score"],
+            grid_results["best_params"],
+        )
+    else:
+        logger.info("Fitting pipeline on training split...")
+        pipeline.fit(list(train_df["text"]), list(train_df["label"]))
 
     val_metrics = _evaluate(pipeline, val_df["text"], val_df["label"], split_name="val")
     test_metrics = _evaluate(pipeline, test_df["text"], test_df["label"], split_name="test")
@@ -166,7 +236,7 @@ def train(
     joblib.dump(pipeline, model_path)
     logger.info("Saved model to %s", model_path)
 
-    metrics_payload = {
+    metrics_payload: dict = {
         "model_version": APP_VERSION,
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dataset_path": str(dataset_path),
@@ -178,6 +248,8 @@ def train(
         "validation": val_metrics,
         "test": test_metrics,
     }
+    if grid_results is not None:
+        metrics_payload["grid_search"] = grid_results
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
     logger.info("Saved metrics to %s", metrics_path)
@@ -191,6 +263,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--metrics-path", type=Path, default=DEFAULT_METRICS_PATH)
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_STATE)
+    parser.add_argument(
+        "--grid-search",
+        action="store_true",
+        help="Run a GridSearchCV over alpha + word/char ngram ranges (slower).",
+    )
     return parser
 
 
@@ -203,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
             model_path=args.model_path,
             metrics_path=args.metrics_path,
             random_state=args.seed,
+            grid_search=args.grid_search,
         )
     except (FileNotFoundError, ValueError) as exc:
         logger.error("Training failed: %s", exc)

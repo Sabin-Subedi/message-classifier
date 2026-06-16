@@ -1,4 +1,4 @@
-.PHONY: help sync data train evaluate run test lint format \
+.PHONY: help sync data train train-tuned evaluate run test lint format \
         docker-build docker-up docker-down docker-logs clean
 
 UV ?= uv
@@ -9,6 +9,7 @@ help:
 	@echo "  sync           Create venv and install runtime + dev deps via uv"
 	@echo "  data           Download raw data and build processed dataset"
 	@echo "  train          Train the classifier and save artifacts to models/"
+	@echo "  train-tuned    Train with GridSearchCV over alpha + ngram ranges (slower)"
 	@echo "  evaluate       Re-evaluate the trained model on the test split"
 	@echo "  run            Run the FastAPI service locally on PORT (default 8000)"
 	@echo "  test           Run pytest"
@@ -30,6 +31,9 @@ data:
 
 train:
 	$(UV) run python -m scripts.train
+
+train-tuned:
+	$(UV) run python -m scripts.train --grid-search
 
 evaluate:
 	$(UV) run python -m scripts.evaluate

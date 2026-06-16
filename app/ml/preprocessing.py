@@ -26,8 +26,33 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b", re.IGNORECASE)
-_NON_ALPHA_RE = re.compile(r"[^a-z\s]+")
+# Sentinels emitted in place of `!` / `?` runs so TF-IDF can pick up
+# punctuation as a feature without us touching the vectorizer config.
+_EXCLAMATION_TOKEN = "_excl_"
+_QUESTION_TOKEN = "_qst_"
+_PUNCT_RUN_RE = re.compile(r"[!?]+")
+# After the sentinels are inserted, strip everything that isn't a letter,
+# whitespace, or underscore (so the sentinels survive).
+_NON_ALPHA_RE = re.compile(r"[^a-z\s_]+")
 _WHITESPACE_RE = re.compile(r"\s+")
+
+# Tokens we explicitly KEEP even though NLTK lists them in the English
+# stopword set, because they flip sentiment / signal toxicity.
+_NEGATION_KEEP: frozenset[str] = frozenset(
+    {
+        "no", "not", "nor", "never", "none", "nothing", "nobody",
+        "n't",
+        "don", "doesn", "didn", "won", "wouldn", "couldn",
+        "shouldn", "isn", "aren", "wasn", "weren",
+        "hasn", "haven", "hadn",
+        "ain", "mightn", "mustn", "needn", "shan",
+    }
+)
+
+# Tokens whose identity we want to preserve through lemmatization.
+_DO_NOT_LEMMATIZE: frozenset[str] = _NEGATION_KEEP | frozenset(
+    {_EXCLAMATION_TOKEN, _QUESTION_TOKEN}
+)
 
 _REQUIRED_RESOURCES: tuple[tuple[str, str], ...] = (
     ("punkt", "tokenizers/punkt"),
@@ -96,7 +121,7 @@ def _ensure_nltk() -> None:
                         raise
 
         _LEMMATIZER = WordNetLemmatizer()
-        _STOPWORDS = frozenset(nltk_stopwords.words("english"))
+        _STOPWORDS = frozenset(nltk_stopwords.words("english")) - _NEGATION_KEEP
         _NLTK_READY = True
 
 
@@ -111,11 +136,26 @@ def _tokenize(text: str) -> list[str]:
         return text.split()
 
 
+def _replace_punct_run(match: re.Match[str]) -> str:
+    """Map a run of `!`/`?` to a single sentinel token.
+
+    A run that contains any `!` becomes ``_excl_``; otherwise (`?`-only)
+    it becomes ``_qst_``. The replacement is wrapped in spaces so it
+    survives subsequent tokenization.
+    """
+
+    run = match.group(0)
+    token = _EXCLAMATION_TOKEN if "!" in run else _QUESTION_TOKEN
+    return f" {token} "
+
+
 def clean_text(text: Any) -> str:
     """Normalize a single message into a space-separated cleaned string.
 
-    Steps: lowercase -> strip URLs/emails -> remove non-letters ->
-    tokenize -> drop stopwords/short tokens -> lemmatize.
+    Steps: lowercase -> strip URLs/emails -> replace `!`/`?` runs with
+    sentinel tokens -> remove other non-letters -> tokenize -> drop
+    stopwords/short tokens (preserving negations) -> lemmatize
+    (preserving sentinels and negations).
     """
 
     if text is None:
@@ -127,6 +167,7 @@ def clean_text(text: Any) -> str:
     text = text.lower()
     text = _URL_RE.sub(" ", text)
     text = _EMAIL_RE.sub(" ", text)
+    text = _PUNCT_RUN_RE.sub(_replace_punct_run, text)
     text = _NON_ALPHA_RE.sub(" ", text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
 
@@ -141,6 +182,9 @@ def clean_text(text: Any) -> str:
         if len(tok) < 2:
             continue
         if tok in _STOPWORDS:
+            continue
+        if tok in _DO_NOT_LEMMATIZE or tok.startswith("_"):
+            cleaned.append(tok)
             continue
         lemma = _LEMMATIZER.lemmatize(tok) if _LEMMATIZER is not None else tok
         cleaned.append(lemma)
